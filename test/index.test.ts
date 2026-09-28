@@ -3,6 +3,7 @@ import type { Judge, JudgmentRequest, JudgmentResult, Questions } from "@oh-my-p
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import extension from "../src/index";
 import { assessToolCall, findTools, formatReport, readConfig, recommendTool, setConfig, toolSuggestion } from "../src/index";
 
 const dirs: string[] = [];
@@ -187,4 +188,24 @@ test("concurrent settings writes preserve both updates and reject invalid values
   const before = await readFile(file, "utf8");
   await expect(setConfig(file, "threshold", "nan")).rejects.toThrow();
   expect(await readFile(file, "utf8")).toBe(before);
+});
+
+test("extension factory registers without initialized Settings", () => {
+  // Git-install validation runs the factory before Settings.init(); agent-dir access must be deferred.
+  const registered: string[] = [];
+  const pi = {
+    registerTool: () => registered.push("tool"),
+    registerCommand: () => registered.push("command"),
+    on: () => registered.push("hook"),
+    getAllTools: () => [],
+    getActiveTools: () => [],
+    zod: { object: () => ({}), string: () => ({ describe: () => ({}) }) },
+    logger: { warn: () => {} },
+    pi: { Settings: {} as Record<string, unknown> },
+  };
+  Object.defineProperty(pi.pi.Settings, "instance", {
+    get() { throw new Error("Settings not initialized. Call Settings.init() first."); },
+  });
+  expect(() => extension(pi as never)).not.toThrow();
+  expect(registered).toEqual(["tool", "command", "command", "hook", "hook"]);
 });

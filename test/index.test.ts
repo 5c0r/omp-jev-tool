@@ -132,9 +132,13 @@ test("later Judge batch failure keeps explicit scores but suppresses automatic a
   expect(toolSuggestion(report)).toBeUndefined();
 });
 
-test("large parameter schema stays in returned hit without exhausting Judge input", async () => {
+test("only accepted parameter schemas are converted and never sent to Judge", async () => {
   const largeSchema = { description: "x".repeat(30_000) };
-  const candidate = { ...tool("read"), parameters: { toJsonSchema: () => largeSchema } };
+  let conversions = 0;
+  const candidate = { ...tool("read"), parameters: { toJsonSchema: () => {
+    conversions++;
+    return largeSchema;
+  } } };
   const bounded: Judge = {
     label: "bounded judge",
     async judge<Q extends Questions>(request: JudgmentRequest<Q>): Promise<JudgmentResult<Q>> {
@@ -146,6 +150,16 @@ test("large parameter schema stays in returned hit without exhausting Judge inpu
   const report = await findTools("read file", [candidate], new Set(["read"]), bounded, 0.65, 2000);
   expect(report.results[0].status).toBe("accepted");
   expect(report.results[0].schema).toContain("x".repeat(30_000));
+  expect(conversions).toBe(1);
+  const rejected = await findTools("read file", [candidate], new Set(["read"]), judge([0.1]), 0.65, 2000);
+  expect(rejected.results[0].status).toBe("rejected");
+  expect(rejected.results[0].schema).toBeUndefined();
+  expect(conversions).toBe(1);
+  const offline = { label: "offline", async judge() { throw new Error("judge unavailable"); } };
+  const unjudged = await findTools("read file", [candidate], new Set(["read"]), offline, 0.65, 2000);
+  expect(unjudged.results[0].status).toBe("unjudged");
+  expect(unjudged.results[0].schema).toBeUndefined();
+  expect(conversions).toBe(1);
 });
 
 test("advisory skips calls without a prompt and uses task context when present", async () => {

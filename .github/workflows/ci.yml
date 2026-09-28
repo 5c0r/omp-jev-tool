@@ -11,4 +11,6 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun test
       - run: bun run typecheck
-      - run: bun build src/index.ts --target bun --external '@oh-my-pi/pi-coding-agent/*' --outdir /tmp/jev-build
+      - run: bun run build
+      - name: dist staleness guard
+        run: git diff --exit-code -- dist

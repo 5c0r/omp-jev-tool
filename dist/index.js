@@ -4,7 +4,11 @@ import { dirname, join } from "node:path";
 import { setTimeout as pause } from "node:timers/promises";
 import { cfgExtensionHandlersToolCallTimeoutMs } from "@oh-my-pi/pi-coding-agent/extensibility/settings";
 import { journalJudgmentUsage, resolveJudge } from "@oh-my-pi/pi-coding-agent/judgment";
-const defaults = { debug: true, autoSuggest: false, checkCalls: false, threshold: 0.65, timeoutMs: 10000 };
+const defaults = { debug: true, autoSuggest: false, autoSelect: false, checkCalls: false, threshold: 0.65, timeoutMs: 10000 };
+const coreToolNames = {
+    read: true, write: true, edit: true, bash: true, grep: true, glob: true,
+    todo: true, task: true, wait: true, ask: true, web_search: true, lsp: true,
+};
 const batchSize = 16;
 function schemaText(parameters) {
     try {
@@ -47,9 +51,11 @@ export async function findTools(task, tools, active, judge, threshold, timeoutMs
             if (signal.aborted)
                 throw signal.reason;
             const response = await settleOnAbort(judge.judge({
-                state: JSON.stringify({ task, tools: batch.map((candidate, index) => ({
+                state: JSON.stringify({
+                    task, tools: batch.map((candidate, index) => ({
                         id: `tool_${index}`, name: candidate.name, description: candidate.description, active: candidate.active,
-                    })) }),
+                    }))
+                }),
                 questions,
             }, { signal }), signal);
             const answers = response.answers;
@@ -122,7 +128,7 @@ export async function assessToolCall(task, chosen, tools, active, judge, thresho
 function parseValue(key, value) {
     if (!Object.hasOwn(defaults, key))
         throw new Error(`Unknown setting: ${key}`);
-    if (key === "debug" || key === "autoSuggest" || key === "checkCalls") {
+    if (key === "debug" || key === "autoSuggest" || key === "autoSelect" || key === "checkCalls") {
         if (value !== "true" && value !== "false")
             throw new Error(`${key} must be true or false`);
         return value === "true";
@@ -234,6 +240,12 @@ export function formatReport(report, config) {
 export default function (pi) {
     const configFile = () => join(pi.pi.Settings.instance.getAgentDir(), "jev-tool.json");
     let lastTask;
+    const toolRosters = new Map();
+    const restoreToolRoster = async (sessionId) => {
+        const roster = toolRosters.get(sessionId);
+        if (roster !== undefined)
+            await pi.setActiveTools([...roster]);
+    };
     const judgeFor = (ctx) => resolveJudge({
         settings: pi.pi.Settings.instance, registry: ctx.modelRegistry,
         sessionId: ctx.sessionManager.getSessionId(),
@@ -282,10 +294,14 @@ export default function (pi) {
                     ctx.ui.notify(`${configFile()}\n${JSON.stringify(await readConfig(configFile()), null, 2)}`, "info");
                 }
                 else if (parts[0] === "set" && parts.length === 3) {
-                    ctx.ui.notify(JSON.stringify(await setConfig(configFile(), parts[1], parts[2]), null, 2), "info");
+                    const config = await setConfig(configFile(), parts[1], parts[2]);
+                    if (parts[1] === "autoSelect" && parts[2] === "false") {
+                        await restoreToolRoster(ctx.sessionManager.getSessionId());
+                    }
+                    ctx.ui.notify(JSON.stringify(config, null, 2), "info");
                 }
                 else {
-                    ctx.ui.notify("Usage: /jev-tool-config [status|set <debug|autoSuggest|checkCalls|threshold|timeoutMs> <value>]", "warning");
+                    ctx.ui.notify("Usage: /jev-tool-config [status|set <debug|autoSuggest|autoSelect|checkCalls|threshold|timeoutMs> <value>]", "warning");
                 }
             }
             catch (cause) {
@@ -297,9 +313,40 @@ export default function (pi) {
         lastTask = { sessionId: ctx.sessionManager.getSessionId(), prompt: event.prompt };
         try {
             const config = await readConfig(configFile());
+            let report;
+            if (config.autoSelect && event.prompt.trim()) {
+                const sessionId = ctx.sessionManager.getSessionId();
+                let roster = toolRosters.get(sessionId);
+                if (roster === undefined) {
+                    roster = [...pi.getActiveTools()];
+                    toolRosters.set(sessionId, roster);
+                }
+                try {
+                    report = await run(event.prompt, config, ctx);
+                    const rosterNames = new Set(roster);
+                    const protectedTools = roster.filter(name => Object.hasOwn(coreToolNames, name));
+                    const acceptedTools = report.results.filter(result => result.status === "accepted" && (!Object.hasOwn(coreToolNames, result.name) || rosterNames.has(result.name)));
+                    if (report.error || !acceptedTools.length) {
+                        pi.logger.warn("Jev tool auto-selection unavailable", { error: report.error ?? "no accepted tools" });
+                        await restoreToolRoster(sessionId);
+                    }
+                    else {
+                        await pi.setActiveTools([...new Set([...protectedTools, ...acceptedTools.map(result => result.name)])]);
+                    }
+                }
+                catch (cause) {
+                    pi.logger.warn("Jev tool auto-selection unavailable", { error: cause instanceof Error ? cause.message : String(cause) });
+                    await restoreToolRoster(sessionId);
+                }
+                if (report) {
+                    const activeTools = new Set(pi.getActiveTools());
+                    for (const result of report.results)
+                        result.active = activeTools.has(result.name);
+                }
+            }
             if (!config.autoSuggest || !event.prompt.trim())
                 return;
-            const suggestion = toolSuggestion(await run(event.prompt, config, ctx));
+            const suggestion = toolSuggestion(report ?? await run(event.prompt, config, ctx));
             if (!suggestion)
                 return;
             return { message: { customType: "jev-tool-suggestion", display: true, content: suggestion } };

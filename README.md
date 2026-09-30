@@ -27,6 +27,7 @@ dependency, not a runtime dependency. No TypeSafe API key is configured here.
 | --- | --- | --- |
 | `debug` | `true` | `true`, `false` |
 | `autoSuggest` | `false` | `true`, `false` |
+| `autoSelect` | `false` | `true`, `false` |
 | `checkCalls` | `false` | `true`, `false` |
 | `threshold` | `0.65` | finite number from 0 to 1 |
 | `timeoutMs` | `10000` | integer from 100 to 20000 |
@@ -44,14 +45,23 @@ actual provider/model, elapsed time, token usage/cost, and any Judge error.
 Scores measure **tool relevance**, not correctness of proposed arguments.
 Judge calls can incur provider charges.
 
-`autoSuggest` adds up to three optional suggestions before a prompt; inactive
-hits are marked as requiring activation. `checkCalls` compares model tool
-choice against the most recent prompt, **not raw tool arguments**, and advises
-only callable (active) alternatives scored above threshold. Enabling either
-hook sends that prompt to the configured Judge provider. Normal OMP approvals
-and execution stay unchanged. If Judge lacks auth, fails, returns malformed
-answers, or times out, explicit search reports it; automatic hooks do nothing
-(including after a partially scored batch). No extra model fallback.
+`autoSelect` re-judges each non-empty prompt. First enabled prompt snapshots
+active tools for that session; selection preserves roster-active core tools,
+activates relevant inactive non-core tools, and removes low-scoring roster
+tools. Core tools absent from original roster stay disabled. Judge failure,
+timeout, or empty selection restores original roster. `/jev-tool-config set
+autoSelect false` restores it too. Snapshot stays in session memory.
+
+`autoSuggest` independently adds up to three optional suggestions before a
+prompt; when combined with `autoSelect`, suggestions show post-selection active
+state. `checkCalls` compares model tool choice against most recent prompt, **not
+raw tool arguments**, and advises only callable (active) alternatives above
+threshold. Enabling any automatic hook sends prompt context to configured Judge
+provider. Normal OMP approvals and execution stay unchanged. If Judge lacks
+auth, fails, returns malformed answers, or times out, explicit search reports
+it; `autoSelect` restores roster, `autoSuggest` emits no message, and `checkCalls`
+gives no advisory (including after a partially scored batch). No extra model
+fallback.
 
 ## Develop
 

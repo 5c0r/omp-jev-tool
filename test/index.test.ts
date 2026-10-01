@@ -86,6 +86,7 @@ async function extensionHarness(tools: TestTool[], roster: string[]) {
   const selections: string[][] = [];
   const messages: AsideMessage[] = [];
   const messageSent = Promise.withResolvers<AsideMessage>();
+  const secondMessageSent = Promise.withResolvers<AsideMessage>();
   const context = {
     modelRegistry: {},
     sessionManager: { getSessionId: () => "session-1" },
@@ -105,6 +106,7 @@ async function extensionHarness(tools: TestTool[], roster: string[]) {
       const entry = { payload, options, afterAgentStart: turnRunning };
       messages.push(entry);
       messageSent.resolve(entry);
+      if (messages.length === 2) secondMessageSent.resolve(entry);
     },
     getAllTools: () => tools,
     getActiveTools: () => [...active],
@@ -129,6 +131,7 @@ async function extensionHarness(tools: TestTool[], roster: string[]) {
     selections,
     messages,
     messageSent: messageSent.promise,
+    secondMessageSent: secondMessageSent.promise,
     active: () => active,
     prepare,
     launch,
@@ -473,4 +476,39 @@ test("before A then B binds agent_start to latest generation", async () => {
   expect(harness.messages[0].payload.content).toContain("second");
   expect(harness.messages[0].payload.content).not.toContain("first");
   expect(harness.selections).toEqual([["read", "stale", "second"]]);
+});
+test("completed prompt additions remain active across the next prompt", async () => {
+  const harness = await extensionHarness(
+    [tool("read"), tool("first"), tool("second")], ["read"],
+  );
+  await writeFile(harness.configFile, JSON.stringify({ autoSuggest: true }));
+  const first = controlledJudge("first");
+  const second = controlledJudge("second");
+  extensionJudge = first.judge;
+
+  const firstStart = harness.start("use first tool");
+  await first.started;
+  first.resolve([0.1, 0.95, 0.1]);
+  await firstStart;
+  await harness.messageSent;
+  expect(harness.active()).toEqual(["read", "first"]);
+  harness.end();
+  expect(harness.active()).toEqual(["read", "first"]);
+
+  extensionJudge = second.judge;
+  const secondStart = harness.start("use second tool");
+  await second.started;
+  second.resolve([0.1, 0.1, 0.95]);
+  await secondStart;
+  await harness.secondMessageSent;
+  harness.end();
+
+  expect(harness.messages).toHaveLength(2);
+  expect(harness.messages[0].payload.content).toContain("first");
+  expect(harness.messages[1].payload.content).toContain("second");
+  expect(harness.selections).toEqual([
+    ["read", "first"],
+    ["read", "first", "second"],
+  ]);
+  expect(harness.active()).toEqual(["read", "first", "second"]);
 });

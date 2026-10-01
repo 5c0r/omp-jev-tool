@@ -40,31 +40,71 @@ const judge = (scores: number[]): Judge => ({
     } as unknown as JudgmentResult<Q>;
   },
 });
-type BeforeStartHandler = (event: { prompt: string }, ctx: unknown) => Promise<unknown>;
-type ConfigCommandHandler = (args: string, ctx: unknown) => Promise<void>;
+type BeforeStartHandler = (event: { prompt: string }, ctx: unknown) => Promise<unknown> | unknown;
+type LifecycleHandler = (event: unknown, ctx: unknown) => void;
+type AsideMessage = {
+  payload: { customType?: string; display?: boolean; content?: string };
+  options?: { deliverAs?: string };
+  afterAgentStart: boolean;
+};
+
+function controlledJudge(model: string) {
+  const started = Promise.withResolvers<void>();
+  const scoresReady = Promise.withResolvers<number[]>();
+  let wasStarted = false;
+  const controlled: Judge = {
+    label: model,
+    async judge<Q extends Questions>(request: JudgmentRequest<Q>): Promise<JudgmentResult<Q>> {
+      wasStarted = true;
+      started.resolve();
+      const scores = await scoresReady.promise;
+      return {
+        api: "typesafe", provider: "typesafe", model, usage,
+        answers: Object.fromEntries(Object.keys(request.questions).map((id, index) => [
+          id, { type: "noul", noul: scores[index] },
+        ])),
+      } as unknown as JudgmentResult<Q>;
+    },
+  };
+  return {
+    judge: controlled,
+    started: started.promise,
+    wasStarted: () => wasStarted,
+    resolve: (scores: number[]) => scoresReady.resolve(scores),
+  };
+}
 
 async function extensionHarness(tools: TestTool[], roster: string[]) {
   const dir = await mkdtemp(join(tmpdir(), "jev-tool-extension-"));
   dirs.push(dir);
   const configFile = join(dir, "jev-tool.json");
   let active = [...roster];
+  let turnRunning = false;
   let beforeStart: BeforeStartHandler | undefined;
-  let configHandler: ConfigCommandHandler | undefined;
+  let agentStart: LifecycleHandler | undefined;
+  let agentEnd: LifecycleHandler | undefined;
   const selections: string[][] = [];
-  let sessionId = "session-1";
+  const messages: AsideMessage[] = [];
+  const messageSent = Promise.withResolvers<AsideMessage>();
   const context = {
     modelRegistry: {},
-    sessionManager: { getSessionId: () => sessionId },
+    sessionManager: { getSessionId: () => "session-1" },
+    isIdle: () => !turnRunning,
     hasUI: true,
     ui: { notify: () => { } },
   };
   extension({
     registerTool: () => { },
-    registerCommand: (name: string, options: { handler: ConfigCommandHandler }) => {
-      if (name === "jev-tool-config") configHandler = options.handler;
+    registerCommand: () => { },
+    on: (name: string, handler: unknown) => {
+      if (name === "before_agent_start") beforeStart = handler as BeforeStartHandler;
+      if (name === "agent_start") agentStart = handler as LifecycleHandler;
+      if (name === "agent_end") agentEnd = handler as LifecycleHandler;
     },
-    on: (name: string, handler: BeforeStartHandler) => {
-      if (name === "before_agent_start") beforeStart = handler;
+    sendMessage: (payload: AsideMessage["payload"], options?: AsideMessage["options"]) => {
+      const entry = { payload, options, afterAgentStart: turnRunning };
+      messages.push(entry);
+      messageSent.resolve(entry);
     },
     getAllTools: () => tools,
     getActiveTools: () => [...active],
@@ -76,21 +116,30 @@ async function extensionHarness(tools: TestTool[], roster: string[]) {
     logger: { warn: () => { } },
     pi: { Settings: { instance: { getAgentDir: () => dir } } },
   } as never);
+  const prepare = async (prompt: string) => {
+    if (!beforeStart) throw new Error("before_agent_start handler missing");
+    return beforeStart({ prompt }, context);
+  };
+  const launch = () => {
+    turnRunning = true;
+    agentStart?.({}, context);
+  };
   return {
     configFile,
     selections,
+    messages,
+    messageSent: messageSent.promise,
     active: () => active,
+    prepare,
+    launch,
     async start(prompt: string) {
-      if (!beforeStart) throw new Error("before_agent_start handler missing");
-      return beforeStart({ prompt }, context);
+      const result = await prepare(prompt);
+      launch();
+      return result;
     },
-    async configure(args: string) {
-      if (!configHandler) throw new Error("jev-tool-config handler missing");
-      return configHandler(args, context);
-    },
-    switchSession(id: string, names: string[]) {
-      sessionId = id;
-      active = [...names];
+    end() {
+      turnRunning = false;
+      agentEnd?.({ willContinue: false }, context);
     },
   };
 }
@@ -110,7 +159,7 @@ test("ranks active and inactive registered tools by validated per-candidate scor
 
 test("diagnostics show top five hits with explicit omitted counts, without dropping judged inventory", async () => {
   const tools = Array.from({ length: 12 }, (_, index) => tool(`t${index}`));
-  const config = { debug: true, autoSuggest: false, autoSelect: false, checkCalls: false, threshold: 0.65, timeoutMs: 2000 };
+  const config = { debug: true, autoSuggest: false, checkCalls: false, threshold: 0.65, timeoutMs: 2000 };
   const mostlyRejected = await findTools("read", tools, new Set(["t0"]), judge([0.9, ...Array(11).fill(0.1)]), 0.65, 2000);
   const text = formatReport(mostlyRejected, config);
   expect(text).toContain("- t0 [active] 90.0% [#########-]");
@@ -264,19 +313,17 @@ test("concurrent settings writes preserve both updates and reject invalid values
   const dir = await mkdtemp(join(tmpdir(), "jev-tool-test-")); dirs.push(dir);
   const file = join(dir, "config.json");
   await Promise.all([setConfig(file, "debug", "false"), setConfig(file, "threshold", "0.8")]);
-  expect(await readConfig(file)).toMatchObject({ debug: false, threshold: 0.8, autoSuggest: false, autoSelect: false, checkCalls: false });
+  expect(await readConfig(file)).toMatchObject({ debug: false, threshold: 0.8, autoSuggest: false, checkCalls: false });
   const before = await readFile(file, "utf8");
   await expect(setConfig(file, "threshold", "nan")).rejects.toThrow();
   expect(await readFile(file, "utf8")).toBe(before);
 });
 
-test("extension factory registers without initialized Settings", () => {
-  // Git-install validation runs the factory before Settings.init(); agent-dir access must be deferred.
-  const registered: string[] = [];
+test("extension factory does not access Settings before initialization", () => {
   const pi = {
-    registerTool: () => registered.push("tool"),
-    registerCommand: () => registered.push("command"),
-    on: () => registered.push("hook"),
+    registerTool: () => { },
+    registerCommand: () => { },
+    on: () => { },
     getAllTools: () => [],
     getActiveTools: () => [],
     zod: { object: () => ({}), string: () => ({ describe: () => ({}) }) },
@@ -287,134 +334,143 @@ test("extension factory registers without initialized Settings", () => {
     get() { throw new Error("Settings not initialized. Call Settings.init() first."); },
   });
   expect(() => extension(pi as never)).not.toThrow();
-  expect(registered).toEqual(["tool", "command", "command", "hook", "hook"]);
 });
-test("autoSelect defaults off", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "jev-tool-config-test-")); dirs.push(dir);
-  expect((await readConfig(join(dir, "missing.json"))).autoSelect).toBe(false);
-});
-
-test("autoSelect preserves active core tools, prunes low scores, and activates relevant inactive tools", async () => {
-  const harness = await extensionHarness([tool("read"), tool("stale"), tool("new")], ["read", "stale"]);
-  await writeFile(harness.configFile, JSON.stringify({ autoSelect: true }));
-  extensionJudge = judge([0.1, 0.2, 0.95]);
-
-  await harness.start("inspect files");
-
-  expect(new Set(harness.selections[0])).toEqual(new Set(["read", "new"]));
-  expect(harness.active()).toEqual(["read", "new"]);
-});
-
-test("autoSelect does not reactivate a user-disabled core tool, even when Judge accepts it", async () => {
-  const harness = await extensionHarness([tool("read"), tool("write"), tool("other")], ["read"]);
-  await writeFile(harness.configFile, JSON.stringify({ autoSelect: true }));
-  extensionJudge = judge([0.1, 0.99, 0.9]);
-
-  await harness.start("edit files");
-
-  expect(new Set(harness.active())).toEqual(new Set(["read", "other"]));
-});
-
-test("autoSelect recomputes selection for every prompt", async () => {
-  const harness = await extensionHarness(
-    [tool("read"), tool("stale"), tool("first"), tool("second")], ["read", "stale"],
-  );
-  await writeFile(harness.configFile, JSON.stringify({ autoSelect: true }));
-  extensionJudge = judge([0.1, 0.2, 0.95, 0.1]);
-  await harness.start("first task");
-  extensionJudge = judge([0.1, 0.95, 0.1, 0.9]);
-
-  await harness.start("second task");
-
-  expect(harness.selections).toHaveLength(2);
-  expect(new Set(harness.selections[1])).toEqual(new Set(["read", "stale", "second"]));
-});
-
-test("autoSelect restores original roster after Judge failure or empty selection", async () => {
-  const tools = [tool("read"), tool("stale"), tool("new")];
-  const harness = await extensionHarness(tools, ["read", "stale"]);
-  await writeFile(harness.configFile, JSON.stringify({ autoSelect: true }));
-  extensionJudge = judge([0.1, 0.2, 0.95]);
-  await harness.start("first task");
-  extensionJudge = { label: "offline", async judge() { throw new Error("offline"); } };
-  await harness.start("second task");
-  expect(harness.active()).toEqual(["read", "stale"]);
-
-  extensionJudge = judge([0.1, 0.2, 0.1]);
-  await harness.start("third task");
-
-  expect(harness.selections.slice(-1)[0]).toEqual(["read", "stale"]);
-  expect(harness.active()).toEqual(["read", "stale"]);
-});
-
-test("disabling autoSelect restores original roster", async () => {
-  const harness = await extensionHarness([tool("read"), tool("stale"), tool("new")], ["read", "stale"]);
-  await writeFile(harness.configFile, JSON.stringify({ autoSelect: true }));
-  extensionJudge = judge([0.1, 0.2, 0.95]);
-  await harness.start("select tools");
-
-  await harness.configure("set autoSelect false");
-
-  expect(harness.active()).toEqual(["read", "stale"]);
-  expect((await readConfig(harness.configFile)).autoSelect).toBe(false);
-});
-
-test("autoSuggest remains independent when autoSelect is off", async () => {
-  const harness = await extensionHarness([tool("read"), tool("write")], ["read"]);
-  await writeFile(harness.configFile, JSON.stringify({ autoSuggest: true }));
-  extensionJudge = judge([0.1, 0.95]);
-
-  const result = await harness.start("write a file") as { message?: { customType?: string; content?: string } };
-
-  expect(result.message?.customType).toBe("jev-tool-suggestion");
-  expect(result.message?.content).toContain("write");
-  expect(harness.selections).toEqual([]);
-  expect(harness.active()).toEqual(["read"]);
-});
-test("autoSelect validates boolean values", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "jev-tool-config-test-")); dirs.push(dir);
-  const file = join(dir, "config.json");
-
-  await expect(setConfig(file, "autoSelect", "invalid")).rejects.toThrow("autoSelect must be true or false");
-  expect((await setConfig(file, "autoSelect", "true")).autoSelect).toBe(true);
-});
-
-test("autoSelect restores roster when Judge times out", async () => {
-  const harness = await extensionHarness([tool("read"), tool("stale")], ["read", "stale"]);
-  await writeFile(harness.configFile, JSON.stringify({ autoSelect: true, timeoutMs: 100 }));
+test("before_agent_start settles under 100ms with a never-resolving Judge", async () => {
+  const harness = await extensionHarness([tool("read"), tool("new")], ["read"]);
+  await writeFile(harness.configFile, JSON.stringify({ autoSuggest: true, timeoutMs: 1000 }));
+  const judgeStarted = Promise.withResolvers<void>();
   extensionJudge = {
-    label: "hung",
-    async judge<Q extends Questions>() {
+    label: "pending",
+    judge<Q extends Questions>() {
+      judgeStarted.resolve();
       return Promise.withResolvers<JudgmentResult<Q>>().promise;
     },
   };
 
-  await harness.start("wait for judge");
+  const startedAt = performance.now();
+  const start = harness.start("write a file");
+  await judgeStarted.promise;
+  const hookResult = await start;
+  const elapsedMs = performance.now() - startedAt;
+  harness.end();
 
-  expect(harness.selections).toEqual([["read", "stale"]]);
-  expect(harness.active()).toEqual(["read", "stale"]);
+  expect(hookResult).toBeUndefined();
+  expect(elapsedMs).toBeLessThan(100);
 });
-test("autoSelect captures a fresh roster for each session", async () => {
-  const tools = [tool("read"), tool("write"), tool("stale"), tool("new")];
-  const harness = await extensionHarness(tools, ["read", "stale"]);
-  await writeFile(harness.configFile, JSON.stringify({ autoSelect: true }));
-  extensionJudge = judge([0.1, 0.1, 0.2, 0.95]);
-  await harness.start("first session");
-  harness.switchSession("session-2", ["write", "stale"]);
-  extensionJudge = judge([0.1, 0.9, 0.2, 0.1]);
 
-  await harness.start("second session");
+test("autoSuggest activates accepted tools additively without removing current tools", async () => {
+  const harness = await extensionHarness([tool("read"), tool("stale"), tool("new")], ["read", "stale"]);
+  await writeFile(harness.configFile, JSON.stringify({ autoSuggest: true }));
+  extensionJudge = judge([0.1, 0.1, 0.95]);
 
-  expect(new Set(harness.selections[0])).toEqual(new Set(["read", "new"]));
-  expect(harness.selections[1]).toEqual(["write"]);
+  const hookResult = await harness.start("use the new tool");
+  expect(hookResult).toBeUndefined();
+  const delivered = await harness.messageSent;
+
+  expect(delivered.payload.content).toContain("new");
+  expect(harness.selections).toEqual([["read", "stale", "new"]]);
+  expect(harness.active()).toEqual(["read", "stale", "new"]);
 });
-test("autoSuggest reports newly auto-selected tools as active", async () => {
+
+test("tool suggestions use aside delivery only after agent_start", async () => {
+  const harness = await extensionHarness([tool("read")], ["read"]);
+  await writeFile(harness.configFile, JSON.stringify({ autoSuggest: true }));
+  extensionJudge = judge([0.95]);
+
+  const hookResult = await harness.start("read a file");
+  expect(hookResult).toBeUndefined();
+  await harness.messageSent;
+
+  expect(harness.messages).toHaveLength(1);
+  expect(harness.messages[0].payload).toMatchObject({ customType: "jev-tool-suggestion", display: true });
+  expect(harness.messages[0].options).toEqual({ deliverAs: "aside" });
+  expect(harness.messages[0].afterAgentStart).toBe(true);
+});
+
+test("autoSelect is rejected as an unknown setting", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "jev-tool-config-test-")); dirs.push(dir);
+  const file = join(dir, "config.json");
+
+  await expect(setConfig(file, "autoSelect", "true")).rejects.toThrow("Unknown setting: autoSelect");
+  await writeFile(file, JSON.stringify({ autoSelect: true }));
+  await expect(readConfig(file)).rejects.toThrow("Unknown setting: autoSelect");
+});
+
+test("late Judge result after agent_end sends nothing and never changes active tools", async () => {
   const harness = await extensionHarness([tool("read"), tool("new")], ["read"]);
-  await writeFile(harness.configFile, JSON.stringify({ autoSelect: true, autoSuggest: true }));
-  extensionJudge = judge([0.1, 0.95]);
+  await writeFile(harness.configFile, JSON.stringify({ autoSuggest: true }));
+  const pending = controlledJudge("late");
+  extensionJudge = pending.judge;
 
-  const result = await harness.start("use new tool") as { message?: { content?: string } };
+  const start = harness.start("use new tool");
+  await pending.started;
+  harness.end();
+  pending.resolve([0.1, 0.95]);
+  const hookResult = await start;
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
 
-  expect(harness.active()).toEqual(["read", "new"]);
-  expect(result.message?.content).toContain("new [active]");
+  expect(hookResult).toBeUndefined();
+  expect(harness.messages).toEqual([]);
+  expect(harness.selections).toEqual([]);
+  expect(harness.active()).toEqual(["read"]);
+});
+
+test("overlapping prompts cancel old Judge work and only current generation activates and delivers", async () => {
+  const harness = await extensionHarness(
+    [tool("read"), tool("stale"), tool("first"), tool("second")], ["read", "stale"],
+  );
+  await writeFile(harness.configFile, JSON.stringify({ autoSuggest: true }));
+  const first = controlledJudge("first");
+  const second = controlledJudge("second");
+  extensionJudge = first.judge;
+
+  const firstStart = harness.start("use first tool");
+  await first.started;
+  extensionJudge = second.judge;
+  const secondStart = harness.start("use second tool");
+  await second.started;
+  first.resolve([0.1, 0.1, 0.95, 0.1]);
+  second.resolve([0.1, 0.1, 0.1, 0.95]);
+  const [firstResult, secondResult] = await Promise.all([firstStart, secondStart]);
+  expect(firstResult).toBeUndefined();
+  expect(secondResult).toBeUndefined();
+  await harness.messageSent;
+  harness.end();
+
+  expect(harness.messages).toHaveLength(1);
+  expect(harness.messages[0].payload.content).toContain("second");
+  expect(harness.messages[0].payload.content).not.toContain("first");
+  expect(harness.selections).toEqual([["read", "stale", "second"]]);
+});
+test("before A then B binds agent_start to latest generation", async () => {
+  const harness = await extensionHarness(
+    [tool("read"), tool("first"), tool("second")], ["read", "stale"],
+  );
+  await writeFile(harness.configFile, JSON.stringify({ autoSuggest: true }));
+  const first = controlledJudge("first");
+  const second = controlledJudge("second");
+  extensionJudge = {
+    label: "prompt dispatcher",
+    judge<Q extends Questions>(request: JudgmentRequest<Q>) {
+      const selected = JSON.stringify(request.state).includes("second prompt") ? second.judge : first.judge;
+      return selected.judge(request);
+    },
+  };
+
+  await harness.prepare("use first prompt");
+  await harness.prepare("use second prompt");
+  harness.launch();
+
+  expect(first.wasStarted()).toBe(false);
+  expect(second.wasStarted()).toBe(true);
+  second.resolve([0.1, 0.1, 0.95]);
+  await harness.messageSent;
+  harness.end();
+
+  expect(harness.messages).toHaveLength(1);
+  expect(harness.messages[0].payload.content).toContain("second");
+  expect(harness.messages[0].payload.content).not.toContain("first");
+  expect(harness.selections).toEqual([["read", "stale", "second"]]);
 });

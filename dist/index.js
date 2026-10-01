@@ -4,11 +4,7 @@ import { dirname, join } from "node:path";
 import { setTimeout as pause } from "node:timers/promises";
 import { cfgExtensionHandlersToolCallTimeoutMs } from "@oh-my-pi/pi-coding-agent/extensibility/settings";
 import { journalJudgmentUsage, resolveJudge } from "@oh-my-pi/pi-coding-agent/judgment";
-const defaults = { debug: true, autoSuggest: false, autoSelect: false, checkCalls: false, threshold: 0.65, timeoutMs: 10000 };
-const coreToolNames = {
-    read: true, write: true, edit: true, bash: true, grep: true, glob: true,
-    todo: true, task: true, wait: true, ask: true, web_search: true, lsp: true,
-};
+const defaults = { debug: true, autoSuggest: false, checkCalls: false, threshold: 0.65, timeoutMs: 10000 };
 const batchSize = 16;
 function schemaText(parameters) {
     try {
@@ -128,7 +124,7 @@ export async function assessToolCall(task, chosen, tools, active, judge, thresho
 function parseValue(key, value) {
     if (!Object.hasOwn(defaults, key))
         throw new Error(`Unknown setting: ${key}`);
-    if (key === "debug" || key === "autoSuggest" || key === "autoSelect" || key === "checkCalls") {
+    if (key === "debug" || key === "autoSuggest" || key === "checkCalls") {
         if (value !== "true" && value !== "false")
             throw new Error(`${key} must be true or false`);
         return value === "true";
@@ -240,12 +236,16 @@ export function formatReport(report, config) {
 export default function (pi) {
     const configFile = () => join(pi.pi.Settings.instance.getAgentDir(), "jev-tool.json");
     let lastTask;
-    const toolRosters = new Map();
-    const restoreToolRoster = async (sessionId) => {
-        const roster = toolRosters.get(sessionId);
-        if (roster !== undefined)
-            await pi.setActiveTools([...roster]);
-    };
+    const promptIds = new Map();
+    const currentPrompts = new Map();
+    const sessionPrompts = new Map();
+    const isCurrentPrompt = (sessionId, generation, ctx) => currentPrompts.get(sessionId) === generation
+        && promptIds.get(sessionId) === generation.promptId
+        && !generation.controller.signal.aborted
+        && generation.started
+        && !generation.ended
+        && ctx.sessionManager.getSessionId() === sessionId
+        && !ctx.isIdle();
     const judgeFor = (ctx) => resolveJudge({
         settings: pi.pi.Settings.instance, registry: ctx.modelRegistry,
         sessionId: ctx.sessionManager.getSessionId(),
@@ -295,13 +295,10 @@ export default function (pi) {
                 }
                 else if (parts[0] === "set" && parts.length === 3) {
                     const config = await setConfig(configFile(), parts[1], parts[2]);
-                    if (parts[1] === "autoSelect" && parts[2] === "false") {
-                        await restoreToolRoster(ctx.sessionManager.getSessionId());
-                    }
                     ctx.ui.notify(JSON.stringify(config, null, 2), "info");
                 }
                 else {
-                    ctx.ui.notify("Usage: /jev-tool-config [status|set <debug|autoSuggest|autoSelect|checkCalls|threshold|timeoutMs> <value>]", "warning");
+                    ctx.ui.notify("Usage: /jev-tool-config [status|set <debug|autoSuggest|checkCalls|threshold|timeoutMs> <value>]", "warning");
                 }
             }
             catch (cause) {
@@ -310,50 +307,97 @@ export default function (pi) {
         },
     });
     pi.on("before_agent_start", async (event, ctx) => {
-        lastTask = { sessionId: ctx.sessionManager.getSessionId(), prompt: event.prompt };
-        try {
-            const config = await readConfig(configFile());
-            let report;
-            if (config.autoSelect && event.prompt.trim()) {
-                const sessionId = ctx.sessionManager.getSessionId();
-                let roster = toolRosters.get(sessionId);
-                if (roster === undefined) {
-                    roster = [...pi.getActiveTools()];
-                    toolRosters.set(sessionId, roster);
-                }
-                try {
-                    report = await run(event.prompt, config, ctx);
-                    const rosterNames = new Set(roster);
-                    const protectedTools = roster.filter(name => Object.hasOwn(coreToolNames, name));
-                    const acceptedTools = report.results.filter(result => result.status === "accepted" && (!Object.hasOwn(coreToolNames, result.name) || rosterNames.has(result.name)));
-                    if (report.error || !acceptedTools.length) {
-                        pi.logger.warn("Jev tool auto-selection unavailable", { error: report.error ?? "no accepted tools" });
-                        await restoreToolRoster(sessionId);
-                    }
-                    else {
-                        await pi.setActiveTools([...new Set([...protectedTools, ...acceptedTools.map(result => result.name)])]);
-                    }
-                }
-                catch (cause) {
-                    pi.logger.warn("Jev tool auto-selection unavailable", { error: cause instanceof Error ? cause.message : String(cause) });
-                    await restoreToolRoster(sessionId);
-                }
-                if (report) {
-                    const activeTools = new Set(pi.getActiveTools());
-                    for (const result of report.results)
-                        result.active = activeTools.has(result.name);
-                }
+        const sessionId = ctx.sessionManager.getSessionId();
+        const previous = currentPrompts.get(sessionId);
+        if (previous) {
+            previous.controller.abort();
+            if (!previous.started) {
+                previous.ended = true;
+                const prompts = sessionPrompts.get(sessionId)?.filter(prompt => prompt !== previous);
+                if (prompts?.length)
+                    sessionPrompts.set(sessionId, prompts);
+                else
+                    sessionPrompts.delete(sessionId);
             }
-            if (!config.autoSuggest || !event.prompt.trim())
-                return;
-            const suggestion = toolSuggestion(report ?? await run(event.prompt, config, ctx));
-            if (!suggestion)
-                return;
-            return { message: { customType: "jev-tool-suggestion", display: true, content: suggestion } };
+        }
+        const promptId = (promptIds.get(sessionId) ?? 0) + 1;
+        promptIds.set(sessionId, promptId);
+        const generation = {
+            promptId, prompt: event.prompt, controller: new AbortController(), started: false, ended: false,
+        };
+        currentPrompts.set(sessionId, generation);
+        const prompts = sessionPrompts.get(sessionId) ?? [];
+        prompts.push(generation);
+        sessionPrompts.set(sessionId, prompts);
+        lastTask = { sessionId, prompt: event.prompt };
+        try {
+            generation.config = await readConfig(configFile());
         }
         catch (cause) {
-            pi.logger.warn("Jev tool suggestion unavailable", { error: cause instanceof Error ? cause.message : String(cause) });
+            pi.logger.warn("Jev tool prompt config unavailable", { error: cause instanceof Error ? cause.message : String(cause) });
         }
+    });
+    // Agent-end lacks prompt IDs; pair started turns in order per session.
+    pi.on("agent_start", (_event, ctx) => {
+        const sessionId = ctx.sessionManager.getSessionId();
+        const generation = currentPrompts.get(sessionId);
+        if (!generation || generation.started || generation.ended)
+            return;
+        generation.started = true;
+        const config = generation.config;
+        if (!config?.autoSuggest || !generation.prompt.trim() || !isCurrentPrompt(sessionId, generation, ctx))
+            return;
+        void (async () => {
+            try {
+                const report = await run(generation.prompt, config, ctx, generation.controller.signal);
+                if (!isCurrentPrompt(sessionId, generation, ctx))
+                    return;
+                if (report.error) {
+                    pi.logger.warn("Jev tool auto-routing unavailable", { error: report.error });
+                    return;
+                }
+                const activeTools = pi.getActiveTools();
+                const activeNames = new Set(activeTools);
+                const additions = report.results
+                    .filter(result => result.status === "accepted" && !activeNames.has(result.name))
+                    .map(result => result.name);
+                if (additions.length) {
+                    if (!isCurrentPrompt(sessionId, generation, ctx))
+                        return;
+                    await pi.setActiveTools([...new Set([...activeTools, ...additions])]);
+                }
+                if (!isCurrentPrompt(sessionId, generation, ctx))
+                    return;
+                const activeAfterRouting = new Set(pi.getActiveTools());
+                for (const result of report.results)
+                    result.active = activeAfterRouting.has(result.name);
+                const suggestion = toolSuggestion(report);
+                if (!suggestion || !isCurrentPrompt(sessionId, generation, ctx))
+                    return;
+                pi.sendMessage({ customType: "jev-tool-suggestion", display: true, content: suggestion }, { deliverAs: "aside" });
+            }
+            catch (cause) {
+                if (isCurrentPrompt(sessionId, generation, ctx)) {
+                    pi.logger.warn("Jev tool auto-routing unavailable", { error: cause instanceof Error ? cause.message : String(cause) });
+                }
+            }
+        })();
+    });
+    pi.on("agent_end", (_event, ctx) => {
+        const sessionId = ctx.sessionManager.getSessionId();
+        const prompts = sessionPrompts.get(sessionId);
+        const generation = prompts?.find(prompt => prompt.started && !prompt.ended);
+        if (!generation || !prompts)
+            return;
+        generation.ended = true;
+        generation.controller.abort();
+        if (currentPrompts.get(sessionId) === generation)
+            currentPrompts.delete(sessionId);
+        const remaining = prompts.filter(prompt => prompt !== generation);
+        if (remaining.length)
+            sessionPrompts.set(sessionId, remaining);
+        else
+            sessionPrompts.delete(sessionId);
     });
     pi.on("tool_call", async (event, ctx) => {
         try {

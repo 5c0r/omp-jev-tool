@@ -27,7 +27,6 @@ dependency, not a runtime dependency. No TypeSafe API key is configured here.
 | --- | --- | --- |
 | `debug` | `true` | `true`, `false` |
 | `autoSuggest` | `false` | `true`, `false` |
-| `autoSelect` | `false` | `true`, `false` |
 | `checkCalls` | `false` | `true`, `false` |
 | `threshold` | `0.65` | finite number from 0 to 1 |
 | `timeoutMs` | `10000` | integer from 100 to 20000 |
@@ -45,23 +44,32 @@ actual provider/model, elapsed time, token usage/cost, and any Judge error.
 Scores measure **tool relevance**, not correctness of proposed arguments.
 Judge calls can incur provider charges.
 
-`autoSelect` re-judges each non-empty prompt. First enabled prompt snapshots
-active tools for that session; selection preserves roster-active core tools,
-activates relevant inactive non-core tools, and removes low-scoring roster
-tools. Core tools absent from original roster stay disabled. Judge failure,
-timeout, or empty selection restores original roster. `/jev-tool-config set
-autoSelect false` restores it too. Snapshot stays in session memory.
+`autoSuggest` is opt-in and default-off. Judge work starts after `agent_start`,
+never inside the input-sensitive `before_agent_start` hook. After a complete
+successful report, accepted tools are added by union with the current active
+list; existing tools are never removed or restored. Up to three accepted
+matches arrive as a non-interrupting aside. OMP approvals and execution stay
+unchanged.
 
-`autoSuggest` independently adds up to three optional suggestions before a
-prompt; when combined with `autoSelect`, suggestions show post-selection active
-state. `checkCalls` compares model tool choice against most recent prompt, **not
+Migration: `autoSelect` was removed and is now rejected as an unknown setting.
+Remove it from `jev-tool.json`; set `autoSuggest` to `true` to opt into v2
+additive routing and aside suggestions. The default remains off.
+
+`checkCalls` compares model tool choice against the most recent prompt, **not
 raw tool arguments**, and advises only callable (active) alternatives above
-threshold. Enabling any automatic hook sends prompt context to configured Judge
-provider. Normal OMP approvals and execution stay unchanged. If Judge lacks
-auth, fails, returns malformed answers, or times out, explicit search reports
-it; `autoSelect` restores roster, `autoSuggest` emits no message, and `checkCalls`
-gives no advisory (including after a partially scored batch). No extra model
-fallback.
+threshold. Enabling `autoSuggest` or `checkCalls` sends prompt context to the
+configured Judge provider. If Judge lacks auth, fails, returns malformed
+answers, or times out, no tools are activated and no aside is sent (including
+after a partially scored batch). A new prompt or `agent_end` cancels old work;
+stale results are silently discarded. Explicit search still reports Judge
+errors. No extra model fallback.
+
+OMP's public `sendMessage` is fire-and-forget; the host normalizes images before
+rechecking whether the agent is streaming. If a turn ends after the extension's
+final check but before that host check, an idle aside can start a turn. The
+public `setActiveTools` API also has no cancellation signal. The extension
+checks immediately before dispatch, but this narrow host-side race is not
+atomic or structurally eliminated.
 
 ## Develop
 
